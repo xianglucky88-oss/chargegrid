@@ -1,7 +1,7 @@
 
 """Real sqlite3 store: content-hash primary key, INSERT-OR-IGNORE dedup, watermark."""
 import json, sqlite3
-from .config import DB_PATH
+from . import config
 
 class Store:
     def __init__(self, con=None):
@@ -10,7 +10,7 @@ class Store:
             self._init()
 
     def connect(self):
-        con = sqlite3.connect(DB_PATH)
+        con = sqlite3.connect(config.DB_PATH)
         self.__init__(con)
         return con
 

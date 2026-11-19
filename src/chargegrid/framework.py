@@ -17,7 +17,6 @@ class Transport:
     """Client for the bundled local service."""
 
     def __init__(self):
-        import os
         import sys
         for p in (str(SPEC_ROOT()), str(SPEC_ROOT() / "src")):
             if p not in sys.path:
@@ -115,22 +114,54 @@ def parse(resp_body, fmt):
     raise ValueError("unknown fmt: %s" % fmt)
 
 
-def fetch_all(http: Http):
-    """Collect records from the local source."""
-    records, attempts, page = [], 0, 1
+def fetch_all(http: Http, max_pages=None):
+    """Collect records from the local source (see :func:`fetch_pages`)."""
+    records, attempts = [], 0
+    for page_recs, att, _page, _more in fetch_pages(http, max_pages=max_pages):
+        records.extend(page_recs)
+        attempts += att
+    return records, attempts
+
+
+class FetchInterrupted(RuntimeError):
+    """Raised when pagination could not be completed.
+
+    Pages that were yielded before the failure have already been handed to
+    the caller (and therefore already ingested); ``next_page`` says where a
+    later run should continue, and ``status`` preserves the cause.
+    """
+
+    def __init__(self, message, next_page, status, attempts):
+        super().__init__(message)
+        self.next_page = next_page
+        self.status = status
+        self.attempts = attempts
+
+
+def fetch_pages(http: Http, max_pages=None, start_page=1):
+    """Yield ``(rows, attempts, page_number, has_more)`` one page at a time.
+
+    ``has_more`` is true when the source can supply another page, so a
+    truncated crawl knows exactly where to resume.  Field extraction stays in
+    :func:`parse` and retry/backoff stays in :class:`Http`; this function is
+    only responsible for walking the pages.
+    """
+    page = start_page
     while True:
         status, _hdr, body, att = http.get("/" + SPEC.endpoint, params={"page": page})
-        attempts += att + 1
         if status != 200:
-            raise RuntimeError("fetch failed status=%s page=%s" % (status, page))
+            raise FetchInterrupted(
+                "fetch failed status=%s page=%s" % (status, page), page, status,
+                att + 1)
         page_recs = parse(body, SPEC.fmt)
-        records.extend(page_recs)
-        if len(page_recs) < SPEC.page_size:
+        has_more = len(page_recs) >= SPEC.page_size and page < 200
+        yield page_recs, att + 1, page, has_more
+        if not has_more:
             break
         page += 1
-        if page > 200:
+        if max_pages is not None and page - start_page >= max_pages:
             break
-    return records, attempts
+
 
 
 # --------------------------------------------------------------------------- #
@@ -176,31 +207,116 @@ def _apply_kernel(records):
 # --------------------------------------------------------------------------- #
 # Collection pipeline.
 # --------------------------------------------------------------------------- #
-def run(mode="full", con=None):
+def run(mode="full", con=None, max_pages=None, start_page=1,
+        freshness=None, now=None):
+    """Collect heartbeats and fold them into the pile state.
+
+    Parameters
+    ----------
+    mode:
+        ``"full"`` re-reads every page; ``"incremental"`` keeps the watermark
+        for reporting but never discards an older heartbeat, because a late
+        or out-of-order observation still has to be recorded.
+    max_pages, start_page:
+        Bound the crawl.  A crawl that stopped after ``max_pages`` reports
+        ``next_page`` so a later call can resume without re-reading what it
+        already ingested.
+    freshness:
+        Override the freshness window used to decide whether an "available"
+        heartbeat is still meaningful.
+    """
+    from .state import StateEngine
+
     own = con is None
     con = con or Store().connect()
     store = Store(con)
+    engine = StateEngine(con, freshness=freshness, clock=now)
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
+    previous_watermark = store.watermark()
+    all_records, results = [], []
+    attempts = pages = 0
+    interrupted = None
+    has_more = False
+    last_page = start_page - 1
     try:
-        records, attempts = fetch_all(http)
-        norm = [normalize(dict(r)) for r in records]
-        norm, dup_in_batch = dedup(norm)
-        norm = _apply_kernel(norm)
+        # A database restored from an older snapshot may only carry the
+        # legacy record table.  Rebuild its event log before adding new
+        # heartbeats so history stays readable across the upgrade.
+        backfilled = engine.backfill_from_records() if engine.is_empty() else \
+            {"imported": 0, "duplicates": 0, "rejected": 0}
+        try:
+            for page_recs, att, page_no, more in fetch_pages(
+                    http, max_pages=max_pages, start_page=start_page):
+                attempts += att
+                pages += 1
+                last_page = page_no
+                has_more = more
+                norm = [normalize(dict(r)) for r in page_recs]
+                all_records.extend(norm)
+                # Ingest immediately: a later page failure must not throw
+                # away the heartbeats that were already observed.
+                for r in norm:
+                    results.append(engine.ingest(r, source=mode))
+        except FetchInterrupted as exc:
+            interrupted = exc
+            has_more = True
+            attempts += exc.attempts
 
-        wm = store.watermark()
+        # Legacy record table keeps its existing dedup + watermark behaviour.
+        kernelized = _apply_kernel([dict(r) for r in all_records])
+        kernelized, dup_in_batch = dedup(kernelized)
+        wm = previous_watermark
         if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
-
-        ingested = sum(1 for r in norm if store.upsert(r))
+            # Report what the old filter would have dropped, but do not drop
+            # it: the state engine has already recorded those observations.
+            behind = [r for r in kernelized if str(r.get("ts", "")) <= wm]
+        else:
+            behind = []
+        ingested = sum(1 for r in kernelized if store.upsert(r))
         total = store.count()
-        new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
+        new_wm = max([str(r.get("ts", "")) for r in kernelized] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
-        return {"engine": "crawl", "mode": mode, "fetched": len(records),
-                "duplicates": dup_in_batch, "ingested": ingested, "count": total,
-                "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+
+        accepted = [r for r in results if r.accepted]
+        rejected = [r for r in results if not r.accepted]
+        duplicate_obs = [r for r in rejected
+                         if r.reason == "duplicate_observation"]
+        changed = [r for r in accepted if r.changed]
+        states = {pile: v.to_dict()
+                  for pile, v in engine.all_current(now).items()}
+        next_page = interrupted.next_page if interrupted is not None else (
+            last_page + 1 if has_more else None)
+        return {
+            "engine": "crawl",
+            "mode": mode,
+            "fetched": len(all_records),
+            "duplicates": dup_in_batch,
+            "ingested": ingested,
+            "count": total,
+            "http_attempts": attempts,
+            "slept": round(sleeper.slept, 4),
+            "watermark": store.watermark(),
+            # -- state judgment ------------------------------------------- #
+            "pages": pages,
+            "last_page": last_page if pages else None,
+            "complete": interrupted is None and not has_more,
+            "interrupted": interrupted is not None,
+            "interrupt_status": None if interrupted is None else interrupted.status,
+            "next_page": next_page,
+            "observations_accepted": len(accepted),
+            "observations_rejected": len(rejected),
+            "duplicate_observations": len(duplicate_obs),
+            "late_observations": sum(1 for r in accepted if r.late),
+            "behind_watermark": len(behind),
+            "state_changes": len(changed),
+            "states": states,
+            "backfilled": backfilled,
+            "rejections": [r.to_dict() for r in rejected],
+            # Observations from this run that moved a pile's verdict.
+            "verdict_changes": [r.to_dict() for r in changed],
+        }
     finally:
         if own:
             con.close()
@@ -273,15 +389,19 @@ class Rpa:
         return bool(data.get("created"))
 
 
-def run_rpa(con=None):
+def run_rpa(con=None, freshness=None, now=None):
+    from .state import StateEngine
+
     own = con is None
     con = con or Store().connect()
     store = Store(con)
+    engine = StateEngine(con, freshness=freshness, clock=now)
     r = Rpa()
     try:
         logged = r.login()
         items = r.collect()
         norm = [normalize(dict(it)) for it in items]
+        observations = [engine.ingest(dict(it), source="rpa") for it in norm]
         norm, dup = dedup(norm)
         norm = _apply_kernel(norm)
         ingested = sum(1 for x in norm if store.upsert(x))
@@ -298,10 +418,19 @@ def run_rpa(con=None):
         wm = max([str(x.get("ts", "")) for x in norm] + [""])
         if wm:
             store.set_watermark(wm)
+        rejected = [o for o in observations if not o.accepted]
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log,
+                "observations_accepted": len(observations) - len(rejected),
+                "observations_rejected": len(rejected),
+                "duplicate_observations": sum(
+                    1 for o in rejected if o.reason == "duplicate_observation"),
+                "state_changes": sum(1 for o in observations if o.accepted and o.changed),
+                "states": {pile: v.to_dict()
+                           for pile, v in engine.all_current(now).items()},
+                "rejections": [o.to_dict() for o in rejected]}
     finally:
         if own:
             con.close()
